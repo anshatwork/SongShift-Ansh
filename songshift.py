@@ -219,6 +219,114 @@ def add_track_to_youtube_playlist(youtube, playlist_id, video_id):
         print(f"    An error occurred while adding track to playlist: {e}")
         return False
 
+def search_multiple_tracks_on_youtube(youtube, tracks_info, batch_size=50):
+    """Searches for multiple tracks on YouTube Music in a single query."""
+    if not youtube:
+        return {}
+
+    results = {}  # Dictionary to store video_ids for each track
+    
+    # Process tracks in batches to avoid too long queries
+    for i in range(0, len(tracks_info), batch_size):
+        batch = tracks_info[i:i + batch_size]
+        print(f"\nProcessing batch {(i//batch_size) + 1} ({len(batch)} tracks)")
+        
+        # Combine all tracks in the batch into a single search query
+        combined_query = " OR ".join([
+            f'"{track["name"]}" "{track["artist"]}"'
+            for track in batch
+        ])
+        
+        print(f"  Searching YouTube for batch of {len(batch)} songs")
+        try:
+            search_response = youtube.search().list(
+                q=combined_query,
+                part="id,snippet",
+                maxResults=len(batch),  # Get results for all tracks in batch
+                type="video",
+                videoCategoryId="10"  # Music category
+            ).execute()
+
+            videos = search_response.get("items", [])
+            if not videos:
+                print(f"    No results found for this batch.")
+                continue
+
+            # Try to match returned videos with our tracks
+            for video in videos:
+                video_title = video["snippet"]["title"].lower()
+                video_id = video["id"]["videoId"]
+                
+                # Try to find which track this video matches
+                for track in batch:
+                    track_name = track["name"].lower()
+                    artist_name = track["artist"].lower()
+                    
+                    # If both track name and artist are in the video title
+                    if track_name in video_title and artist_name in video_title:
+                        query = f"{track['name']} {track['artist']} {track['album']}"
+                        if query not in results:  # Only store first match
+                            results[query] = video_id
+                            print(f"    Matched: '{track['name']}' by '{track['artist']}' to '{video['snippet']['title']}' (ID: {video_id})")
+
+        except googleapiclient.errors.HttpError as e:
+            print(f"    An HTTP error {e.resp.status} occurred during YouTube search: {e.content}")
+        except Exception as e:
+            print(f"    An error occurred during YouTube search: {e}")
+        
+        # Add a small delay between batch searches
+        time.sleep(1)
+    
+    return results
+
+def bulk_add_tracks_to_youtube_playlist(youtube, playlist_id, video_ids, batch_size=50):
+    """Adds multiple videos (tracks) to a YouTube playlist in bulk."""
+    if not youtube or not playlist_id or not video_ids:
+        return 0
+
+    successful_adds = 0
+    
+    # Process video IDs in batches
+    for i in range(0, len(video_ids), batch_size):
+        batch = video_ids[i:i + batch_size]
+        print(f"\nAdding batch of {len(batch)} tracks to playlist...")
+        
+        # Create a batch request
+        batch_request = youtube.new_batch_http_request()
+        
+        # Add each video to the batch request
+        for video_id in batch:
+            if video_id:  # Skip None values
+                request = youtube.playlistItems().insert(
+                    part="snippet",
+                    body={
+                        "snippet": {
+                            "playlistId": playlist_id,
+                            "resourceId": {
+                                "kind": "youtube#video",
+                                "videoId": video_id
+                            }
+                        }
+                    }
+                )
+                batch_request.add(request)
+        
+        # Execute the batch request
+        try:
+            batch_request.execute()
+            successful_adds += len(batch)
+            print(f"  Successfully added {len(batch)} tracks to playlist.")
+        except googleapiclient.errors.HttpError as e:
+            error_content = e.content.decode('utf-8') if isinstance(e.content, bytes) else str(e.content)
+            print(f"  Error adding batch to playlist: {error_content}")
+        except Exception as e:
+            print(f"  An error occurred while adding batch to playlist: {e}")
+        
+        # Add a small delay between batches to respect rate limits
+        time.sleep(1)
+    
+    return successful_adds
+
 # --- MAIN TRANSFER LOGIC ---
 
 def main():
@@ -262,19 +370,15 @@ def main():
             print(f"  Could not create YouTube playlist for '{sp_playlist['name']}'. Skipping this playlist.")
             continue
 
-        # 4c. Search for each track on YouTube and add to the new YouTube playlist
-        tracks_added_count = 0
-        for i, track_info in enumerate(spotify_tracks):
-            print(f"\n  Processing track {i+1}/{len(spotify_tracks)}: {track_info['artist']} - {track_info['name']}")
-            youtube_video_id = search_track_on_youtube(youtube, track_info)
-            if youtube_video_id:
-                if add_track_to_youtube_playlist(youtube, yt_playlist_id, youtube_video_id):
-                    tracks_added_count += 1
-            else:
-                print(f"    Could not find or add '{track_info['name']}' by '{track_info['artist']}' to YouTube playlist.")
-            # Consider adding a small delay here to avoid hitting API rate limits
-            # import time
-            time.sleep(1) # Sleep for 1 second
+        # 4c. Search for tracks in batches
+        search_results = search_multiple_tracks_on_youtube(youtube, spotify_tracks, batch_size=50)
+        
+        # Extract video IDs from search results
+        video_ids = [search_results.get(f"{track['name']} {track['artist']} {track['album']}")
+                    for track in spotify_tracks]
+        
+        # 4d. Bulk add tracks to the playlist
+        tracks_added_count = bulk_add_tracks_to_youtube_playlist(youtube, yt_playlist_id, video_ids, batch_size=50)
 
         print(f"\nFinished processing playlist '{sp_playlist['name']}'.")
         print(f"  Added {tracks_added_count} out of {len(spotify_tracks)} tracks to YouTube playlist '{sp_playlist['name']}'.")
